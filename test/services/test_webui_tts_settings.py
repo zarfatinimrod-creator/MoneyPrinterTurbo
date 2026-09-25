@@ -308,3 +308,36 @@ def test_minimax_voices_load_only_on_demand_and_sync_the_selected_voice():
     assert not any(item.label == "MiniMax TTS Voice ID" for item in app.text_input)
     assert not any(item.label == "MiniMax Voice Catalog" for item in app.selectbox)
     assert [str(item.value) for item in app.exception] == []
+
+
+def test_kokoro_voice_selector_lists_local_voices_and_keeps_the_saved_one():
+    """Kokoro 是本地模型：选择它时列出 [kokoro] 音色，且恢复已保存的音色。"""
+    test_ui = dict(
+        config.ui,
+        voice_mode="tts",
+        tts_server="kokoro",
+        voice_name="kokoro:am_michael-Male",
+    )
+
+    with (
+        patch.object(config, "ui", test_ui),
+        patch.object(config, "try_save_config", return_value=True),
+        patch.object(
+            voice,
+            "get_kokoro_voices",
+            return_value=["kokoro:af_heart-Female", "kokoro:am_michael-Male"],
+        ),
+    ):
+        app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=30)
+        app.session_state["ui_language"] = "en"
+        app.run()
+        provider_select = _widget_by_key(app.selectbox, "tts_server_select")
+        voice_select = _widget_by_key(
+            app.selectbox,
+            "speech_synthesis_select_kokoro",
+        )
+
+    assert provider_select.value == "kokoro"
+    assert list(voice_select.options) == ["af_heart-Female", "am_michael-Male"]
+    assert voice_select.value == "kokoro:am_michael-Male"
+    assert [str(item.value) for item in app.exception] == []

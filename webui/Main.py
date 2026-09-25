@@ -1268,6 +1268,8 @@ def _infer_tts_server_from_voice(voice_name):
         return "elevenlabs"
     if voice.is_chatterbox_voice(voice_name):
         return "chatterbox"
+    if voice.is_kokoro_voice(voice_name):
+        return "kokoro"
     if voice.is_fish_audio_voice(voice_name):
         return "fish_audio"
     if voice.is_azure_v2_voice(voice_name):
@@ -4953,6 +4955,13 @@ def _get_voice_preview_provider_signature(tts_server: str) -> dict:
             "model_id": config.chatterbox.get("model_id", ""),
             "credential": _credential_signature(config.chatterbox.get("api_key", "")),
         }
+    if tts_server == "kokoro":
+        model_path, voices_path = voice.get_kokoro_model_paths()
+        return {
+            "model_path": model_path,
+            "voices_path": voices_path,
+            "lang": config.kokoro.get("lang", ""),
+        }
     return {}
 
 
@@ -5713,6 +5722,7 @@ def _render_audio_settings(panel, params):
                 ("minimax-tts", "MiniMax TTS"),
                 ("elevenlabs", "ElevenLabs TTS"),
                 ("chatterbox", "Chatterbox TTS"),
+                ("kokoro", "Kokoro TTS (local)"),
                 ("fish_audio", "Fish Audio TTS"),
             ]
 
@@ -5783,6 +5793,9 @@ def _render_audio_settings(panel, params):
                 # 自托管 Chatterbox 服务的预置音色（来自 [chatterbox] voices 配置）
                 _sync_chatterbox_config_from_session_state()
                 filtered_voices = voice.get_chatterbox_voices()
+            elif selected_tts_server == "kokoro":
+                # 本地 Kokoro 模型的音色（读取 voices 文件或 [kokoro] voices 配置）
+                filtered_voices = voice.get_kokoro_voices()
             elif selected_tts_server == "fish_audio":
                 filtered_voices = voice.get_fish_audio_voices()
             else:
@@ -5809,6 +5822,12 @@ def _render_audio_settings(panel, params):
                 if voice.is_chatterbox_voice(v):
                     name = v.split(":", 1)[1] if ":" in v else v
                     return name.replace("-Female", "").replace("-Male", "")
+                if voice.is_kokoro_voice(v):
+                    name = v.split(":", 1)[1] if ":" in v else v
+                    return (
+                        name.replace("Female", tr("Female"))
+                        .replace("Male", tr("Male"))
+                    )
                 if voice.is_minimax_voice(v):
                     return minimax_voice_labels.get(v, v.split(":", 1)[1])
                 if voice.is_fish_audio_voice(v):
