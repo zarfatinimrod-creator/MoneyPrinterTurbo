@@ -518,6 +518,23 @@ model_id = "chatterbox"
 # Voice names exposed by the configured Chatterbox server.
 voices = ["default-Female"]
 
+[kokoro]
+# Local Kokoro-82M TTS (weights Apache-2.0, runtime kokoro-onnx MIT): offline,
+# no API key, and the narration may be used commercially. Install with
+# `pip install kokoro-onnx`, then download both model files into models/kokoro/:
+#   https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+#   https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+# Leave the paths empty to use models/kokoro/.
+model_path = ""
+voices_path = ""
+# Optional voice shortlist, e.g. ["am_michael", "af_heart"]. Empty = every voice
+# in the voices file. Pick one in the WebUI or pass --voice-name kokoro:am_michael.
+voices = []
+# espeak language code; empty = inferred from the voice id (a=en-us, b=en-gb, ...).
+lang = ""
+# Silence between sentences, in seconds.
+sentence_pause = 0.25
+
 [fish_audio]
 # Fish Audio TTS service: https://fish.audio
 # API key: https://fish.audio/app/developers

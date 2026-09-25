@@ -221,6 +221,98 @@ def get_chatterbox_voices() -> list[str]:
     return result
 
 
+# Kokoro-82M runs locally through kokoro-onnx. The weights are Apache-2.0 and
+# kokoro-onnx is MIT, so narration it produces can be used commercially — the
+# licence question free Edge TTS leaves open. Model files are published as
+# release assets of thewh1teagle/kokoro-onnx; nothing is downloaded at runtime.
+KOKORO_MODEL_URL = (
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+    "model-files-v1.0/kokoro-v1.0.onnx"
+)
+KOKORO_VOICES_URL = (
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/"
+    "model-files-v1.0/voices-v1.0.bin"
+)
+# The first letter of a Kokoro voice id is its language, the second its gender
+# (af_heart = American English, female). Hebrew has no Kokoro voice.
+_KOKORO_LANG_BY_PREFIX = {
+    "a": "en-us",
+    "b": "en-gb",
+    "e": "es",
+    "f": "fr-fr",
+    "h": "hi",
+    "i": "it",
+    "j": "ja",
+    "p": "pt-br",
+    "z": "cmn",
+}
+_KOKORO_DEFAULT_VOICES = (
+    "af_heart",
+    "af_bella",
+    "af_nicole",
+    "af_sarah",
+    "am_michael",
+    "am_adam",
+    "am_fenrir",
+    "am_puck",
+    "bf_emma",
+    "bf_isabella",
+    "bm_george",
+    "bm_lewis",
+)
+_kokoro_engines = {}
+_kokoro_engines_lock = threading.Lock()
+
+
+def _kokoro_voice_label(voice_id: str) -> str:
+    voice_id = voice_id.strip()
+    if voice_id.endswith(("-Female", "-Male")):
+        return f"kokoro:{voice_id}"
+    gender = {"f": "Female", "m": "Male"}.get(voice_id[1:2], "")
+    return f"kokoro:{voice_id}-{gender}" if gender else f"kokoro:{voice_id}"
+
+
+def get_kokoro_model_paths() -> tuple[str, str]:
+    """Return ``(model_path, voices_path)``, defaulting to ``models/kokoro/``."""
+    base_dir = os.path.join(utils.root_dir(), "models", "kokoro")
+    model_path = str(config.kokoro.get("model_path", "") or "").strip()
+    voices_path = str(config.kokoro.get("voices_path", "") or "").strip()
+    return (
+        model_path or os.path.join(base_dir, "kokoro-v1.0.onnx"),
+        voices_path or os.path.join(base_dir, "voices-v1.0.bin"),
+    )
+
+
+def get_kokoro_voices() -> list[str]:
+    """Return Kokoro voices in the ``kokoro:<id>-<Gender>`` dispatcher format.
+
+    ``[kokoro] voices`` wins when set (a TOML array or a comma-separated
+    string). Otherwise the voice ids are read from the voices file, and before
+    the model is downloaded a fixed English shortlist keeps the dropdown usable.
+    """
+    configured = config.kokoro.get("voices", []) or []
+    if isinstance(configured, str):
+        configured = [v.strip() for v in configured.split(",") if v.strip()]
+    voice_ids = [
+        str(v).strip().removeprefix("kokoro:") for v in configured if str(v).strip()
+    ]
+
+    if not voice_ids:
+        _, voices_path = get_kokoro_model_paths()
+        if os.path.exists(voices_path):
+            try:
+                import numpy as np
+
+                with np.load(voices_path) as voices_file:
+                    voice_ids = sorted(voices_file.files)
+            except Exception as e:
+                logger.warning(f"failed to read Kokoro voices file: {str(e)}")
+
+    if not voice_ids:
+        voice_ids = list(_KOKORO_DEFAULT_VOICES)
+    return [_kokoro_voice_label(v) for v in voice_ids]
+
+
 def get_fish_audio_voices() -> list[str]:
     """Return configured Fish Audio voices.
 
@@ -343,6 +435,10 @@ def get_elevenlabs_api_key() -> str:
 
 def is_chatterbox_voice(voice_name: str) -> bool:
     return (voice_name or "").startswith("chatterbox:")
+
+
+def is_kokoro_voice(voice_name: str) -> bool:
+    return (voice_name or "").startswith("kokoro:")
 
 
 def is_fish_audio_voice(voice_name: str) -> bool:
@@ -544,6 +640,15 @@ def tts(
         else:
             logger.error(f"Invalid chatterbox voice name format: {voice_name}")
             return None
+    elif is_kokoro_voice(voice_name):
+        # 格式: kokoro:<voice_id>，可带显示用的 -Female/-Male 后缀
+        kokoro_voice = voice_name.split(":", 1)[1].strip()
+        if kokoro_voice.endswith(("-Female", "-Male")):
+            kokoro_voice = kokoro_voice.rsplit("-", 1)[0]
+        if kokoro_voice:
+            return kokoro_tts(text, kokoro_voice, voice_file, voice_rate, voice_volume)
+        logger.error(f"Invalid kokoro voice name format: {voice_name}")
+        return None
     elif is_fish_audio_voice(voice_name):
         parts = voice_name.split(":")
         reference_id = parts[1] if len(parts) >= 2 else "default"
@@ -1741,6 +1846,241 @@ def chatterbox_tts(
             logger.error(f"chatterbox tts failed: {str(e)}")
 
     return None
+
+
+# Sentence ends that keep their punctuation for the model; a decimal point has no
+# whitespace after it, so "3.5" is never a break.
+_KOKORO_SENTENCE_BREAK = re.compile(r"(?<=[.!?…。！？])\s+|\n+")
+_KOKORO_YEAR = re.compile(
+    r"(?<![$\d,.])\b(1[1-9])(\d{2})\b(?!\d|[.,]\d|\s?%|x\b|\s?dollars)"
+)
+_KOKORO_MONEY = re.compile(
+    r"\$\s?(\d[\d,]*(?:\.\d+)?)"
+    r"(?:\s?(million|billion|trillion|thousand)\b|([kKmMbB])(?:n)?\b)?"
+)
+_KOKORO_MONEY_SCALE = {"k": "thousand", "m": "million", "b": "billion"}
+
+
+def normalize_kokoro_english(text: str) -> str:
+    """Spell out the numbers espeak-ng misreads, before English Kokoro synthesis.
+
+    kokoro-onnx phonemises through espeak-ng, which reads "$5,400" as "dollar
+    five thousand four hundred", "3.5%" as "three. five percent" and "1990" as
+    "nineteen hundred ninety". Only the spoken text changes; subtitles keep the
+    script's own figures.
+    """
+
+    def _year(match: re.Match) -> str:
+        century, rest = match.group(1), match.group(2)
+        if rest == "00":
+            return f"{century} hundred"
+        if rest.startswith("0"):
+            return f"{century} oh {rest[1]}"
+        return f"{century} {rest}"
+
+    def _money(match: re.Match) -> str:
+        scale = match.group(2) or _KOKORO_MONEY_SCALE.get(
+            (match.group(3) or "").lower(), ""
+        )
+        return f"{match.group(1)} {scale} dollars" if scale else f"{match.group(1)} dollars"
+
+    text = _KOKORO_YEAR.sub(_year, text)
+    text = _KOKORO_MONEY.sub(_money, text)
+    text = re.sub(r"(\d)\s?%", r"\1 percent", text)
+    text = re.sub(r"(\d)x\b", r"\1 times", text)
+    text = re.sub(
+        r"(\d+)\.(\d+)",
+        lambda m: f"{m.group(1)} point {' '.join(m.group(2))}",
+        text,
+    )
+    return text
+
+
+def _split_kokoro_sentences(text: str) -> list[tuple[str, list[str]]]:
+    """Return ``(sentence, clauses)`` pairs.
+
+    The sentence, punctuation included, is what Kokoro speaks, so commas pause
+    and questions rise. The clauses are the same pieces ``create_subtitle()``
+    cuts the script into, so the subtitle lines still match one for one.
+    """
+    segments = []
+    for sentence in _KOKORO_SENTENCE_BREAK.split(text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        clauses = [
+            c.strip() for c in utils.split_string_by_punctuations(sentence) if c.strip()
+        ]
+        if clauses:
+            segments.append((sentence, clauses))
+    return segments
+
+
+def _get_kokoro_engine(model_path: str, voices_path: str):
+    """Load a Kokoro model once per process; loading takes seconds, synthesis doesn't."""
+    key = (model_path, voices_path)
+    with _kokoro_engines_lock:
+        engine = _kokoro_engines.get(key)
+        if engine is None:
+            from kokoro_onnx import Kokoro
+
+            engine = Kokoro(model_path, voices_path)
+            _kokoro_engines[key] = engine
+        return engine
+
+
+def _encode_float_pcm(samples, sample_rate: int, output_file: str) -> bool:
+    """Encode mono float32 PCM to ``output_file`` with FFmpeg (format from the extension)."""
+    ensure_file_path_exists(output_file)
+    command = [
+        utils.get_ffmpeg_binary(),
+        "-y",
+        "-f",
+        "f32le",
+        "-ar",
+        str(int(sample_rate)),
+        "-ac",
+        "1",
+        "-i",
+        "pipe:0",
+    ]
+    if output_file.lower().endswith(".mp3"):
+        command += ["-codec:a", "libmp3lame", "-q:a", "2"]
+    command.append(output_file)
+
+    result = subprocess.run(
+        command,
+        input=samples.astype("<f4").tobytes(),
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        logger.error(f"failed to encode kokoro audio: {stderr[-300:]}")
+        return False
+    if not os.path.exists(output_file) or os.path.getsize(output_file) <= 0:
+        logger.error(f"kokoro audio output file is missing or empty: {output_file}")
+        return False
+    return True
+
+
+def kokoro_tts(
+    text: str,
+    voice: str,
+    voice_file: str,
+    voice_rate: float = 1.0,
+    voice_volume: float = 1.0,
+) -> Union[SubMaker, None]:
+    """Generate speech locally with Kokoro-82M (Apache-2.0) via kokoro-onnx.
+
+    Needs ``pip install kokoro-onnx`` and the two model files from
+    ``KOKORO_MODEL_URL`` / ``KOKORO_VOICES_URL`` in ``models/kokoro/`` (or the
+    paths in ``[kokoro]``). No network, no API key, no per-character cost.
+
+    Each sentence is synthesised as one utterance, punctuation included, so the
+    delivery keeps its pauses and question intonation. Sentence boundaries are
+    therefore measured, not estimated; the clause-level subtitle lines inside a
+    sentence share its span by length. English numbers are spelled out first
+    (``normalize_kokoro_english``) while subtitles keep the script's figures.
+    Licence note: kokoro-onnx phonemises through espeak-ng/phonemizer (GPL-3.0).
+    That governs redistributing those libraries, not the audio they help make.
+    """
+    text = (text or "").strip()
+    if not text:
+        logger.error("Kokoro TTS text is empty")
+        return None
+
+    model_path, voices_path = get_kokoro_model_paths()
+    missing = [p for p in (model_path, voices_path) if not os.path.exists(p)]
+    if missing:
+        logger.error(
+            f"Kokoro model files not found: {', '.join(missing)}. Download "
+            f"{KOKORO_MODEL_URL} and {KOKORO_VOICES_URL} into models/kokoro/, "
+            "or set [kokoro] model_path / voices_path in config.toml"
+        )
+        return None
+
+    try:
+        import numpy as np
+
+        engine = _get_kokoro_engine(model_path, voices_path)
+    except ImportError:
+        logger.error("kokoro-onnx is not installed, run: pip install kokoro-onnx")
+        return None
+    except Exception as e:
+        logger.error(f"failed to load Kokoro model: {str(e)}")
+        return None
+
+    lang = str(config.kokoro.get("lang", "") or "").strip()
+    lang = lang or _KOKORO_LANG_BY_PREFIX.get(voice[:1], "en-us")
+    # Kokoro accepts speed 0.5-2.0; MoneyPrinterTurbo's rate is 1.0-centred.
+    speed = max(0.5, min(2.0, float(voice_rate or 1.0)))
+    try:
+        pause_seconds = float(config.kokoro.get("sentence_pause", 0.25))
+    except (TypeError, ValueError):
+        pause_seconds = 0.25
+    pause_seconds = max(0.0, min(2.0, pause_seconds))
+
+    segments = _split_kokoro_sentences(text)
+    if not segments:
+        logger.error("Kokoro TTS text has nothing to speak")
+        return None
+    normalise = lang.startswith("en")
+
+    try:
+        logger.info(
+            f"start kokoro tts, voice: {voice}, lang: {lang}, sentences: {len(segments)}"
+        )
+        chunks = []
+        clause_spans = []
+        cursor = 0
+        sample_rate = 0
+        for index, (sentence, clauses) in enumerate(segments):
+            spoken = normalize_kokoro_english(sentence) if normalise else sentence
+            samples, sample_rate = engine.create(
+                spoken, voice=voice, speed=speed, lang=lang
+            )
+            samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+
+            # The sentence's span is measured; its clauses share it by length,
+            # the same estimate the other non-Edge engines use for a whole script.
+            total_chars = sum(len(c) for c in clauses)
+            start = cursor
+            for clause_index, clause in enumerate(clauses):
+                if clause_index == len(clauses) - 1:
+                    end = cursor + len(samples)
+                else:
+                    end = start + int(len(samples) * len(clause) / total_chars)
+                clause_spans.append((clause, start, end))
+                start = end
+
+            chunks.append(samples)
+            cursor += len(samples)
+            if index < len(segments) - 1 and pause_seconds > 0:
+                pause = np.zeros(int(sample_rate * pause_seconds), dtype=np.float32)
+                chunks.append(pause)
+                cursor += len(pause)
+
+        audio = np.concatenate(chunks) * float(voice_volume or 1.0)
+        audio = np.clip(audio, -1.0, 1.0)
+        if not audio.size or not sample_rate:
+            logger.error("kokoro tts produced no audio")
+            return None
+        if not _encode_float_pcm(audio, sample_rate, voice_file):
+            return None
+    except Exception as e:
+        logger.error(f"kokoro tts failed: {str(e)}")
+        return None
+
+    # SubMaker offsets are in 100ns units, like the edge_tts word boundaries.
+    sub_maker = ensure_legacy_submaker_fields(SubMaker())
+    sub_maker.subs = [clause for clause, _, _ in clause_spans]
+    sub_maker.offset = [
+        (int(start * 10_000_000 / sample_rate), int(end * 10_000_000 / sample_rate))
+        for _, start, end in clause_spans
+    ]
+    logger.success(f"kokoro tts succeeded: {voice_file}")
+    return sub_maker
 
 
 # Fish Audio supported models.

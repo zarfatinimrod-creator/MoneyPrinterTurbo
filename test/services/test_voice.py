@@ -933,6 +933,295 @@ class TestVoiceService(unittest.TestCase):
         self.assertIsNone(result)
         post.assert_not_called()
 
+    def test_kokoro_voice_helpers(self):
+        """is_kokoro_voice / get_kokoro_voices: config list, voices file, fallback."""
+        self.assertTrue(vs.is_kokoro_voice("kokoro:am_michael-Male"))
+        self.assertFalse(vs.is_kokoro_voice("chatterbox:default-Female"))
+        self.assertFalse(vs.is_kokoro_voice(""))
+        self.assertFalse(vs.is_kokoro_voice(None))
+
+        # configured entries gain the prefix and a gender suffix from the id
+        with patch.object(
+            vs.config, "kokoro", {"voices": ["am_michael", "kokoro:af_heart"]}
+        ):
+            self.assertEqual(
+                vs.get_kokoro_voices(),
+                ["kokoro:am_michael-Male", "kokoro:af_heart-Female"],
+            )
+        with patch.object(vs.config, "kokoro", {"voices": "bm_george, bf_emma ,"}):
+            self.assertEqual(
+                vs.get_kokoro_voices(),
+                ["kokoro:bm_george-Male", "kokoro:bf_emma-Female"],
+            )
+
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            voices_path = str(Path(tmp_dir) / "voices.bin")
+            with open(voices_path, "wb") as f:
+                np.savez(f, zf_xiaobei=np.zeros(1), am_puck=np.zeros(1))
+            with patch.object(
+                vs.config, "kokoro", {"voices_path": voices_path, "voices": []}
+            ):
+                self.assertEqual(
+                    vs.get_kokoro_voices(),
+                    ["kokoro:am_puck-Male", "kokoro:zf_xiaobei-Female"],
+                )
+
+            # no model downloaded yet: the English shortlist keeps the UI usable
+            with patch.object(
+                vs.config,
+                "kokoro",
+                {"voices_path": str(Path(tmp_dir) / "missing.bin")},
+            ):
+                voices = vs.get_kokoro_voices()
+        self.assertIn("kokoro:am_michael-Male", voices)
+        self.assertTrue(all(v.startswith("kokoro:") for v in voices))
+
+    def _fake_kokoro_engine(self, seconds_per_sentence):
+        import numpy as np
+
+        calls = []
+
+        class _FakeKokoro:
+            def create(self, text, voice, speed, lang):
+                calls.append(
+                    {"text": text, "voice": voice, "speed": speed, "lang": lang}
+                )
+                seconds = seconds_per_sentence[len(calls) - 1]
+                return np.full(int(24000 * seconds), 0.1, dtype=np.float32), 24000
+
+        return _FakeKokoro(), calls
+
+    def test_kokoro_tts_uses_real_sentence_offsets(self):
+        """Each subtitle gets its own sentence's measured span, not a length-based share."""
+        engine, calls = self._fake_kokoro_engine([1.0, 2.5, 0.5])
+        text = "Short one. This sentence takes much longer to say. End."
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_path = Path(tmp_dir) / "kokoro.onnx"
+            voices_path = Path(tmp_dir) / "voices.bin"
+            model_path.write_bytes(b"x")
+            voices_path.write_bytes(b"x")
+            with patch.object(
+                vs.config,
+                "kokoro",
+                {
+                    "model_path": str(model_path),
+                    "voices_path": str(voices_path),
+                    "sentence_pause": 0.5,
+                },
+            ), patch.object(vs, "_get_kokoro_engine", return_value=engine):
+                voice_file = str(Path(tmp_dir) / "kokoro.mp3")
+                sub_maker = vs.kokoro_tts(
+                    text=text,
+                    voice="am_michael",
+                    voice_file=voice_file,
+                    voice_rate=3.0,
+                    voice_volume=1.0,
+                )
+                audio_seconds = vs.get_audio_duration(voice_file)
+
+        self.assertIsNotNone(sub_maker)
+        # whole sentences reach the model with their punctuation, for natural prosody
+        self.assertEqual(
+            [c["text"] for c in calls],
+            ["Short one.", "This sentence takes much longer to say.", "End."],
+        )
+        # the language comes from the voice id; speed is clamped to Kokoro's 0.5-2.0
+        self.assertEqual({c["lang"] for c in calls}, {"en-us"})
+        self.assertEqual({c["speed"] for c in calls}, {2.0})
+        self.assertEqual(
+            sub_maker.subs,
+            ["Short one", "This sentence takes much longer to say", "End"],
+        )
+        # 1.0s, pause 0.5s, 2.5s, pause 0.5s, 0.5s -> spans in 100ns units
+        self.assertEqual(
+            sub_maker.offset,
+            [(0, 10_000_000), (15_000_000, 40_000_000), (45_000_000, 50_000_000)],
+        )
+        self.assertAlmostEqual(vs.get_audio_duration(sub_maker), 5.0)
+        # the encoded file really holds the audio (mp3 frames pad a little)
+        self.assertAlmostEqual(audio_seconds, 5.0, delta=0.15)
+
+    def test_kokoro_tts_speaks_whole_sentences_and_times_clauses_inside_them(self):
+        """Commas stay inside one utterance; clause subtitles share its measured span."""
+        engine, calls = self._fake_kokoro_engine([1.0, 0.5])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_path = Path(tmp_dir) / "kokoro.onnx"
+            voices_path = Path(tmp_dir) / "voices.bin"
+            model_path.write_bytes(b"x")
+            voices_path.write_bytes(b"x")
+            with patch.object(
+                vs.config,
+                "kokoro",
+                {"model_path": str(model_path), "voices_path": str(voices_path)},
+            ), patch.object(vs, "_get_kokoro_engine", return_value=engine):
+                sub_maker = vs.kokoro_tts(
+                    text="One, two. Three?",
+                    voice="am_michael",
+                    voice_file=str(Path(tmp_dir) / "a.mp3"),
+                )
+
+        # the question mark reaches the model, so the question keeps its intonation
+        self.assertEqual([c["text"] for c in calls], ["One, two.", "Three?"])
+        # subtitles stay clause-level, matching create_subtitle()'s script lines
+        self.assertEqual(sub_maker.subs, ["One", "two", "Three"])
+        # sentence 1 is 1.0 s, split by characters between its two clauses;
+        # the default 0.25 s pause separates it from sentence 2 (0.5 s)
+        self.assertEqual(
+            sub_maker.offset,
+            [(0, 5_000_000), (5_000_000, 10_000_000), (12_500_000, 17_500_000)],
+        )
+
+    def test_kokoro_english_number_normalisation(self):
+        """espeak misreads currency, decimals, percentages and years; spell them out."""
+        cases = {
+            "$5,400": "5,400 dollars",
+            "$2.5 million": "2 point 5 million dollars",
+            "3.5%": "3 point 5 percent",
+            "grew 12 %": "grew 12 percent",
+            "1.8x faster": "1 point 8 times faster",
+            "pi is 3.14": "pi is 3 point 1 4",
+            "in 1990,": "in 19 90,",
+            "by 1905": "by 19 oh 5",
+            "since 1900.": "since 19 hundred.",
+            "in 2008": "in 2008",
+            "1990 dollars and $1990": "1990 dollars and 1990 dollars",
+            "5,400 people": "5,400 people",
+        }
+        for raw, spoken in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(vs.normalize_kokoro_english(raw), spoken)
+
+    def test_kokoro_tts_speaks_normalised_numbers_but_subtitles_keep_the_script(self):
+        """The model hears words; the viewer reads the original figures."""
+        engine, calls = self._fake_kokoro_engine([2.0, 1.0])
+        text = "Debt grew 3.5% to $5,400 in 1990. Hola."
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_path = Path(tmp_dir) / "kokoro.onnx"
+            voices_path = Path(tmp_dir) / "voices.bin"
+            model_path.write_bytes(b"x")
+            voices_path.write_bytes(b"x")
+            with patch.object(
+                vs.config,
+                "kokoro",
+                {"model_path": str(model_path), "voices_path": str(voices_path)},
+            ), patch.object(vs, "_get_kokoro_engine", return_value=engine):
+                sub_maker = vs.kokoro_tts(
+                    text=text,
+                    voice="am_michael",
+                    voice_file=str(Path(tmp_dir) / "a.mp3"),
+                )
+
+        self.assertEqual(
+            calls[0]["text"], "Debt grew 3 point 5 percent to 5,400 dollars in 19 90."
+        )
+        self.assertEqual(sub_maker.subs[0], "Debt grew 3.5% to $5,400 in 1990")
+
+        # only English voices are normalised: Spanish espeak rules differ
+        engine, calls = self._fake_kokoro_engine([1.0])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_path = Path(tmp_dir) / "kokoro.onnx"
+            voices_path = Path(tmp_dir) / "voices.bin"
+            model_path.write_bytes(b"x")
+            voices_path.write_bytes(b"x")
+            with patch.object(
+                vs.config,
+                "kokoro",
+                {"model_path": str(model_path), "voices_path": str(voices_path)},
+            ), patch.object(vs, "_get_kokoro_engine", return_value=engine):
+                vs.kokoro_tts(
+                    text="Cuesta 3.5%.",
+                    voice="ef_dora",
+                    voice_file=str(Path(tmp_dir) / "b.mp3"),
+                )
+        self.assertEqual(calls[0]["text"], "Cuesta 3.5%.")
+        self.assertEqual(calls[0]["lang"], "es")
+
+    def test_kokoro_offsets_build_a_matching_subtitle_file(self):
+        """The SubMaker kokoro_tts returns feeds create_subtitle line for line."""
+        engine, _ = self._fake_kokoro_engine([1.0, 2.0])
+        text = "Compound interest is slow. Then it is not."
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_path = Path(tmp_dir) / "kokoro.onnx"
+            voices_path = Path(tmp_dir) / "voices.bin"
+            model_path.write_bytes(b"x")
+            voices_path.write_bytes(b"x")
+            with patch.object(
+                vs.config,
+                "kokoro",
+                {
+                    "model_path": str(model_path),
+                    "voices_path": str(voices_path),
+                    "sentence_pause": 0,
+                },
+            ), patch.object(vs, "_get_kokoro_engine", return_value=engine):
+                sub_maker = vs.kokoro_tts(
+                    text=text,
+                    voice="af_heart",
+                    voice_file=str(Path(tmp_dir) / "a.mp3"),
+                )
+                subtitle_file = str(Path(tmp_dir) / "a.srt")
+                vs.create_subtitle(sub_maker, text, subtitle_file)
+                srt = Path(subtitle_file).read_text(encoding="utf-8")
+
+        self.assertIn("00:00:00,000 --> 00:00:01,000", srt)
+        self.assertIn("00:00:01,000 --> 00:00:03,000", srt)
+        self.assertIn("Compound interest is slow", srt)
+        self.assertIn("Then it is not", srt)
+
+    def test_tts_dispatches_kokoro_voices(self):
+        """kokoro:<id>-<Gender> reaches kokoro_tts with the bare voice id."""
+        with patch.object(vs, "kokoro_tts", return_value="sub") as kokoro_tts:
+            result = vs.tts(
+                text="hi",
+                voice_name="kokoro:am_michael-Male",
+                voice_rate=1.1,
+                voice_file="out.mp3",
+                voice_volume=0.8,
+            )
+        self.assertEqual(result, "sub")
+        kokoro_tts.assert_called_once_with("hi", "am_michael", "out.mp3", 1.1, 0.8)
+
+    def test_kokoro_tts_requires_model_files(self):
+        """Missing model files short-circuit before the model is loaded."""
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.config,
+            "kokoro",
+            {
+                "model_path": str(Path(tmp_dir) / "none.onnx"),
+                "voices_path": str(Path(tmp_dir) / "none.bin"),
+            },
+        ), patch.object(vs, "_get_kokoro_engine") as get_engine:
+            result = vs.kokoro_tts(text="hi", voice="am_michael", voice_file="x.mp3")
+        self.assertIsNone(result)
+        get_engine.assert_not_called()
+
+    def test_kokoro_tts_without_the_package(self):
+        """An ImportError from kokoro-onnx fails the voice cleanly, it does not raise."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model_path = Path(tmp_dir) / "kokoro.onnx"
+            voices_path = Path(tmp_dir) / "voices.bin"
+            model_path.write_bytes(b"x")
+            voices_path.write_bytes(b"x")
+            with patch.object(
+                vs.config,
+                "kokoro",
+                {"model_path": str(model_path), "voices_path": str(voices_path)},
+            ), patch.object(
+                vs, "_get_kokoro_engine", side_effect=ImportError("kokoro_onnx")
+            ):
+                result = vs.kokoro_tts(
+                    text="hi",
+                    voice="am_michael",
+                    voice_file=str(Path(tmp_dir) / "x.mp3"),
+                )
+        self.assertIsNone(result)
+
     def test_chatterbox_tts_returns_none_on_http_error(self):
         """A non-200 response is retried up to 3 times, then fails to None."""
 
